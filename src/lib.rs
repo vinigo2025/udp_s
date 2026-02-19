@@ -3,8 +3,8 @@ use std::io;
 
 pub fn init() -> io::Result<()> {
     // bind port
-    let socket = UdpSocket::bind("0.0.0.0:8082")?;
-    println!("listen: udp port 8082");
+    let socket = UdpSocket::bind("0.0.0.0:12808")?;
+    println!("listen: udp port 12808");
 
     let mut buf = [0; 65536];
 

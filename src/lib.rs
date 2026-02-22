@@ -1,8 +1,11 @@
+pub mod client;
+
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 const DEFAULT_UDP_PORT: u16 = 12808;
 const DEFAULT_TCP_PORT: u16 = 12809;
@@ -43,69 +46,97 @@ pub fn run_bridge(udp_port: u16, tcp_port: u16) -> io::Result<()> {
     let tcp_target = format!("127.0.0.1:{tcp_port}");
 
     let udp = UdpSocket::bind(&udp_bind)?;
-    let tcp = TcpStream::connect(&tcp_target)?;
-    tcp.set_nodelay(true)?;
-
     println!("udp listen: {udp_bind}");
     println!("tcp target: {tcp_target}");
 
     let udp_rx = udp.try_clone()?;
     let udp_tx = udp.try_clone()?;
+    let last_client = Arc::new(Mutex::new(None::<SocketAddr>));
+    let last_client_udp = Arc::clone(&last_client);
+    let (udp_to_tcp_tx, udp_to_tcp_rx) = mpsc::channel::<Vec<u8>>();
 
-    let mut tcp_tx = tcp.try_clone()?;
-    let mut tcp_rx = tcp;
-
-    let (client_tx, client_rx) = mpsc::channel::<SocketAddr>();
-
-    let udp_to_tcp = thread::spawn(move || -> io::Result<()> {
+    thread::spawn(move || -> io::Result<()> {
         let mut buf = [0_u8; 65_507];
         loop {
             let (n, src) = udp_rx.recv_from(&mut buf)?;
-            client_tx.send(src).map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "client address channel closed")
+            {
+                let mut guard = last_client_udp
+                    .lock()
+                    .map_err(|_| io::Error::other("last_client mutex poisoned"))?;
+                *guard = Some(src);
+            }
+            udp_to_tcp_tx.send(buf[..n].to_vec()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "udp->tcp queue closed",
+                )
             })?;
-            tcp_tx.write_all(&buf[..n])?;
         }
     });
 
-    let tcp_to_udp = thread::spawn(move || -> io::Result<()> {
-        let mut last_client: Option<SocketAddr> = None;
+    loop {
+        let mut tcp = match TcpStream::connect(&tcp_target) {
+            Ok(stream) => {
+                println!("tcp connected: {tcp_target}");
+                stream
+            }
+            Err(err) => {
+                eprintln!("tcp connect error: {err}; retry in 1s");
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        tcp.set_nodelay(true)?;
+        tcp.set_read_timeout(Some(Duration::from_millis(200)))?;
         let mut buf = [0_u8; 65_507];
 
-        loop {
-            match client_rx.try_recv() {
-                Ok(addr) => last_client = Some(addr),
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "client address channel disconnected",
-                    ));
+        'connected: loop {
+            loop {
+                match udp_to_tcp_rx.try_recv() {
+                    Ok(packet) => {
+                        if let Err(err) = tcp.write_all(&packet) {
+                            eprintln!("tcp write error: {err}; reconnecting");
+                            break 'connected;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "udp->tcp queue disconnected",
+                        ));
+                    }
                 }
             }
 
-            let n = tcp_rx.read(&mut buf)?;
+            let n = match tcp.read(&mut buf) {
+                Ok(n) => n,
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!("tcp read error: {err}; reconnecting");
+                    break 'connected;
+                }
+            };
             if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "tcp connection closed",
-                ));
+                eprintln!("tcp closed by peer; reconnecting");
+                break 'connected;
             }
-
-            if let Some(addr) = last_client {
+            let addr_opt = {
+                let guard = last_client
+                    .lock()
+                    .map_err(|_| io::Error::other("last_client mutex poisoned"))?;
+                *guard
+            };
+            if let Some(addr) = addr_opt {
                 udp_tx.send_to(&buf[..n], addr)?;
             }
         }
-    });
-
-    join_bridge_thread(udp_to_tcp)?;
-    join_bridge_thread(tcp_to_udp)?;
-    Ok(())
-}
-
-fn join_bridge_thread(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
-    match handle.join() {
-        Ok(res) => res,
-        Err(_) => Err(io::Error::other("bridge thread panicked")),
+        thread::sleep(Duration::from_secs(1));
     }
 }

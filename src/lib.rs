@@ -1,14 +1,21 @@
 pub mod client;
+pub mod reliable_udp;
 
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use reliable_udp::ReliableUdp;
+
 const DEFAULT_UDP_PORT: u16 = 12808;
 const DEFAULT_TCP_PORT: u16 = 12809;
+const MAX_UDP_PACKET_SIZE: usize = 1250;
+const ACK_TIMEOUT: Duration = Duration::from_millis(250);
+const ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RETRIES: u32 = 8;
 
 pub fn run_from_args() -> io::Result<()> {
     let (udp_port, tcp_port) = parse_ports(env::args())?;
@@ -44,35 +51,19 @@ fn parse_port(raw: &str, name: &str) -> io::Result<u16> {
 pub fn run_bridge(udp_port: u16, tcp_port: u16) -> io::Result<()> {
     let udp_bind = format!("0.0.0.0:{udp_port}");
     let tcp_target = format!("127.0.0.1:{tcp_port}");
-
     let udp = UdpSocket::bind(&udp_bind)?;
+    let reliable_udp = ReliableUdp::from_socket(
+        udp,
+        MAX_UDP_PACKET_SIZE,
+        ACK_TIMEOUT,
+        MAX_RETRIES,
+        ASSEMBLY_TIMEOUT,
+    )?;
+
     println!("udp listen: {udp_bind}");
     println!("tcp target: {tcp_target}");
 
-    let udp_rx = udp.try_clone()?;
-    let udp_tx = udp.try_clone()?;
-    let last_client = Arc::new(Mutex::new(None::<SocketAddr>));
-    let last_client_udp = Arc::clone(&last_client);
-    let (udp_to_tcp_tx, udp_to_tcp_rx) = mpsc::channel::<Vec<u8>>();
-
-    thread::spawn(move || -> io::Result<()> {
-        let mut buf = [0_u8; 65_507];
-        loop {
-            let (n, src) = udp_rx.recv_from(&mut buf)?;
-            {
-                let mut guard = last_client_udp
-                    .lock()
-                    .map_err(|_| io::Error::other("last_client mutex poisoned"))?;
-                *guard = Some(src);
-            }
-            udp_to_tcp_tx.send(buf[..n].to_vec()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "udp->tcp queue closed",
-                )
-            })?;
-        }
-    });
+    let last_peer = Arc::new(Mutex::new(None::<SocketAddr>));
 
     loop {
         let mut tcp = match TcpStream::connect(&tcp_target) {
@@ -88,25 +79,25 @@ pub fn run_bridge(udp_port: u16, tcp_port: u16) -> io::Result<()> {
         };
 
         tcp.set_nodelay(true)?;
-        tcp.set_read_timeout(Some(Duration::from_millis(200)))?;
-        let mut buf = [0_u8; 65_507];
+        tcp.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let mut buf = [0_u8; 64 * 1024];
 
         'connected: loop {
             loop {
-                match udp_to_tcp_rx.try_recv() {
-                    Ok(packet) => {
-                        if let Err(err) = tcp.write_all(&packet) {
+                match reliable_udp.try_recv()? {
+                    Some((peer, message)) => {
+                        {
+                            let mut guard = last_peer
+                                .lock()
+                                .map_err(|_| io::Error::other("last_peer mutex poisoned"))?;
+                            *guard = Some(peer);
+                        }
+                        if let Err(err) = tcp.write_all(&message) {
                             eprintln!("tcp write error: {err}; reconnecting");
                             break 'connected;
                         }
                     }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "udp->tcp queue disconnected",
-                        ));
-                    }
+                    None => break,
                 }
             }
 
@@ -127,14 +118,17 @@ pub fn run_bridge(udp_port: u16, tcp_port: u16) -> io::Result<()> {
                 eprintln!("tcp closed by peer; reconnecting");
                 break 'connected;
             }
-            let addr_opt = {
-                let guard = last_client
+
+            let peer = {
+                let guard = last_peer
                     .lock()
-                    .map_err(|_| io::Error::other("last_client mutex poisoned"))?;
+                    .map_err(|_| io::Error::other("last_peer mutex poisoned"))?;
                 *guard
             };
-            if let Some(addr) = addr_opt {
-                udp_tx.send_to(&buf[..n], addr)?;
+            if let Some(peer_addr) = peer {
+                if let Err(err) = reliable_udp.send_message(peer_addr, &buf[..n]) {
+                    eprintln!("udp send error: {err}");
+                }
             }
         }
         thread::sleep(Duration::from_secs(1));
